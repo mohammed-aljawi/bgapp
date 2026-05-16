@@ -1,12 +1,39 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
+
+from search import search_records
 
 
 LANGUAGE_NAMES = ["English", "Arabic", "Spanish", "Swahili", "Somali", "Nepali", "Burmese", "Karen"]
+EMBEDDING_MODEL = "gemini-embedding-001"
+VECTOR_DIR = Path(__file__).parent / "vector_index"
+
+RAG_FIELDS = [
+    "task",
+    "category",
+    "place_name",
+    "address",
+    "phone",
+    "website",
+    "who_it_helps",
+    "what_to_do",
+    "what_to_bring",
+    "local_reality",
+    "transportation_reality",
+    "best_for",
+    "warning",
+    "keywords",
+    "source_name",
+]
 
 
 SYSTEM_RULES = """You are NewBG, a broad but careful local guide for Bowling Green, Kentucky.
@@ -71,6 +98,15 @@ AUDIENCE_RULES = [
 ]
 
 
+@dataclass
+class RagResult:
+    records: pd.DataFrame
+    status: str
+    used_rag: bool
+    index_path: str = ""
+    metadata_path: str = ""
+
+
 def classify_audience(text: str) -> tuple[str, str]:
     lowered = text.lower()
     for label, keywords, guidance in AUDIENCE_RULES:
@@ -115,6 +151,130 @@ def records_to_context(records: pd.DataFrame, max_rows: int = 8) -> str:
     return "\n".join(lines)
 
 
+def records_signature(records: pd.DataFrame) -> str:
+    if records.empty:
+        return "empty"
+    safe = records.fillna("").astype(str)
+    payload = safe.to_csv(index=False, sep="|")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def row_to_document(row: pd.Series) -> str:
+    parts = []
+    for field in RAG_FIELDS:
+        value = str(row.get(field, "")).strip()
+        if value:
+            parts.append(f"{field}: {value}")
+    return "\n".join(parts)
+
+
+def normalize_vectors(vectors: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    return (vectors / norms).astype("float32")
+
+
+def gemini_embed(api_key: str, texts: list[str]) -> np.ndarray:
+    from google import genai
+
+    client = genai.Client(api_key=api_key.strip())
+    response = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=texts,
+    )
+    vectors = [embedding.values for embedding in response.embeddings]
+    return normalize_vectors(np.array(vectors, dtype="float32"))
+
+
+def index_paths(index_name: str, signature: str) -> tuple[Path, Path, Path]:
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", index_name).strip("_") or "records"
+    base = VECTOR_DIR / f"{safe_name}_{signature}"
+    return base.with_suffix(".faiss"), base.with_suffix(".npy"), base.with_suffix(".json")
+
+
+def save_metadata(path: Path, records: pd.DataFrame, docs: list[str], signature: str) -> None:
+    payload = {
+        "signature": signature,
+        "embedding_model": EMBEDDING_MODEL,
+        "count": len(docs),
+        "documents": docs,
+        "records": records.fillna("").to_dict(orient="records"),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def build_or_load_vector_index(
+    records: pd.DataFrame,
+    api_key: str,
+    index_name: str = "local_records",
+) -> tuple[np.ndarray, pd.DataFrame, str, Path, Path]:
+    VECTOR_DIR.mkdir(exist_ok=True)
+    signature = records_signature(records)
+    faiss_path, npy_path, metadata_path = index_paths(index_name, signature)
+
+    if metadata_path.exists() and (faiss_path.exists() or npy_path.exists()):
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        stored_records = pd.DataFrame(metadata.get("records", [])).fillna("")
+        if faiss_path.exists():
+            try:
+                import faiss
+
+                index = faiss.read_index(str(faiss_path))
+                vectors = np.vstack([index.reconstruct(i) for i in range(index.ntotal)]).astype("float32")
+                return vectors, stored_records, "Loaded existing FAISS index", faiss_path, metadata_path
+            except Exception:
+                pass
+        vectors = np.load(npy_path)
+        return vectors, stored_records, "Loaded existing NumPy embedding index", npy_path, metadata_path
+
+    docs = [row_to_document(row) for _, row in records.iterrows()]
+    vectors = gemini_embed(api_key, docs)
+    np.save(npy_path, vectors)
+
+    engine = "Created NumPy embedding index"
+    index_file = npy_path
+    try:
+        import faiss
+
+        index = faiss.IndexFlatIP(vectors.shape[1])
+        index.add(vectors)
+        faiss.write_index(index, str(faiss_path))
+        engine = "Created FAISS index"
+        index_file = faiss_path
+    except Exception:
+        pass
+
+    save_metadata(metadata_path, records, docs, signature)
+    return vectors, records.copy(), engine, index_file, metadata_path
+
+
+def vector_search(vectors: np.ndarray, query_vector: np.ndarray, limit: int) -> tuple[np.ndarray, np.ndarray, str]:
+    scores = vectors @ query_vector[0]
+    ids = np.argsort(scores)[::-1][:limit]
+    return scores[ids], ids, "vector search"
+
+
+def rag_search(records: pd.DataFrame, query: str, api_key: str = "", limit: int = 8, index_name: str = "local_records") -> RagResult:
+    if records.empty or not query.strip():
+        return RagResult(pd.DataFrame(), "No records to search.", False)
+
+    if not api_key.strip():
+        fallback = search_records(records, query, limit=limit)
+        return RagResult(fallback, "No Gemini key set, so NewBG used local keyword search. No embedding index was created.", False)
+
+    try:
+        vectors, indexed_records, engine, index_path, metadata_path = build_or_load_vector_index(records, api_key, index_name)
+        query_vector = gemini_embed(api_key, [query])
+        scores, ids, search_engine = vector_search(vectors, query_vector, limit)
+        out = indexed_records.iloc[[int(item) for item in ids if int(item) >= 0]].copy()
+        out.insert(0, "_rag_score", [round(float(score), 4) for score in scores[: len(out)]])
+        status = f"{engine}; searched with Gemini query embedding. Index file: {index_path.name}"
+        return RagResult(out, status, True, str(index_path), str(metadata_path))
+    except Exception as exc:
+        fallback = search_records(records, query, limit=limit)
+        return RagResult(fallback, f"RAG could not run, so NewBG used local keyword search. Reason: {exc}", False)
+
+
 def friendly_ai_error(exc: Exception) -> str:
     raw = str(exc).lower()
     if "api key" in raw or "authentication" in raw or "unauthorized" in raw or "401" in raw:
@@ -128,39 +288,25 @@ def friendly_ai_error(exc: Exception) -> str:
     return "AI could not finish this request. NewBG kept the app usable and showed local information instead."
 
 
-def has_key(provider: str, key: str) -> bool:
-    return bool(provider and key and key.strip())
+def has_key(key: str) -> bool:
+    return bool(key and key.strip())
 
 
-def ask_ai(provider: str, api_key: str, prompt: str, context: str, language: str = "English") -> tuple[str | None, str | None]:
-    if not has_key(provider, api_key):
-        return None, "No AI key is set. Showing local CSV results only."
+def ask_ai(api_key: str, prompt: str, context: str, language: str = "English") -> tuple[str | None, str | None]:
+    if not has_key(api_key):
+        return None, "No Gemini key is set. Showing local CSV results only."
 
     final_prompt = f"{SYSTEM_RULES}\n\nAnswer language: {language}\n\nLocal records:\n{context}\n\nUser request:\n{prompt}"
 
     try:
-        if provider == "OpenAI":
-            from openai import OpenAI
+        from google import genai
 
-            client = OpenAI(api_key=api_key.strip())
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": final_prompt}],
-                temperature=0.2,
-            )
-            return response.choices[0].message.content, None
-
-        if provider == "Gemini":
-            from google import genai
-
-            client = genai.Client(api_key=api_key.strip())
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=final_prompt,
-            )
-            return getattr(response, "text", ""), None
-
-        return None, "Choose OpenAI or Gemini to use AI help."
+        client = genai.Client(api_key=api_key.strip())
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=final_prompt,
+        )
+        return getattr(response, "text", ""), None
     except Exception as exc:  # Keep the civic guide alive even when AI is cranky.
         return None, friendly_ai_error(exc)
 

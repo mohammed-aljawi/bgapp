@@ -3,5 +3,6 @@ pandas>=2.0
 folium>=0.16
 streamlit-folium>=0.22
 rapidfuzz>=3.9
-openai>=1.40
 google-genai>=1.0
+faiss-cpu>=1.8
+numpy>=1.26

@@ -13,7 +13,7 @@ NewBG is a local-first guide for Bowling Green, Kentucky. It is built as a pract
 - No-Car Reality Checker
 - Folium local map
 - Animal care and parks sections
-- Optional AI assistance with OpenAI or Gemini
+- Gemini-only RAG assistant with CSV retrieval
 - Friendly fallback behavior when no API key exists or AI fails
 
 ## Run
@@ -23,7 +23,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app works without an API key. Add an OpenAI or Gemini key in the sidebar only if you want AI summaries, translation, or personalization.
+The app works without an API key using local CSV keyword search. Add a Gemini API key in the sidebar to enable Gemini embeddings, FAISS vector retrieval, and Gemini answer generation.
 
 ## Data
 
@@ -61,3 +61,25 @@ After editing, restart Streamlit:
 ```bash
 streamlit run app.py
 ```
+
+## RAG index files
+
+RAG code lives in `ai.py`. After you paste a Gemini API key, open the `RAG Index` tab and click `Build / refresh RAG index`.
+
+The app creates files in:
+
+```text
+vector_index/
+```
+
+You should see files like:
+
+```text
+all_csv_records_<hash>.faiss
+all_csv_records_<hash>.npy
+all_csv_records_<hash>.json
+parks_csv_<hash>.faiss
+animal_care_csv_<hash>.faiss
+```
+
+If FAISS is not installed, NewBG still saves a `.npy` embedding index and uses NumPy vector search.

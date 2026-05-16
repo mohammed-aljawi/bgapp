@@ -5,7 +5,7 @@ import streamlit as st
 from folium import Icon, Map, Marker
 from streamlit_folium import st_folium
 
-from ai import LANGUAGE_NAMES, ask_ai, build_report_without_ai, classify_audience, local_answer_without_ai, records_to_context
+from ai import LANGUAGE_NAMES, ask_ai, build_or_load_vector_index, build_report_without_ai, classify_audience, local_answer_without_ai, rag_search, records_to_context
 from components import no_car_label, page_style, render_no_car_checker, render_record_card
 from data_loader import combined_local_records, load_all_data
 from search import search_records
@@ -62,16 +62,11 @@ MAP_COLORS = {
 def sidebar_settings() -> dict[str, str]:
     st.sidebar.title("NewBG settings")
     language = st.sidebar.selectbox("Answer language", LANGUAGE_NAMES)
-    provider = st.sidebar.selectbox("Optional AI provider", ["None", "OpenAI", "Gemini"])
-    api_key = ""
-    if provider != "None":
-        api_key = st.sidebar.text_input(f"{provider} API key", type="password")
-        st.sidebar.caption("AI can summarize, translate, and personalize. Local CSV data remains the source of truth.")
-    else:
-        st.sidebar.caption("No AI key needed. NewBG still works from local data.")
+    api_key = st.sidebar.text_input("Gemini API key", type="password")
+    st.sidebar.caption("Gemini powers RAG retrieval and answer generation. Without a key, NewBG still uses local CSV keyword search.")
     st.sidebar.markdown("---")
-    st.sidebar.write("Local facts are from CSV files. Verify hours, documents, eligibility, and transit before going.")
-    return {"language": language, "provider": provider, "api_key": api_key}
+    st.sidebar.write("Local facts come from CSV files. RAG retrieves from those files first.")
+    return {"language": language, "api_key": api_key}
 
 
 def filtered_task_records(records: pd.DataFrame, task: str) -> pd.DataFrame:
@@ -107,6 +102,34 @@ def homepage(records: pd.DataFrame) -> None:
         show_task(st.session_state["selected_task"], records, key_prefix="home_task")
 
 
+def rag_admin(records: pd.DataFrame, data: dict[str, pd.DataFrame], settings: dict[str, str]) -> None:
+    st.header("RAG Index")
+    st.write("Create Gemini embeddings from the CSV files and save a local vector index.")
+    if not settings["api_key"]:
+        st.info("Paste a Gemini API key in the sidebar to create embeddings and FAISS index files.")
+        return
+
+    index_choice = st.selectbox(
+        "CSV index to build",
+        ["all_csv_records", "parks_csv", "animal_care_csv"],
+        key="rag_admin_index_choice",
+    )
+    source = records
+    if index_choice == "parks_csv":
+        source = data["parks"]
+    elif index_choice == "animal_care_csv":
+        source = data["animal_care"]
+
+    if st.button("Build / refresh RAG index", type="primary"):
+        try:
+            _, _, status, index_path, metadata_path = build_or_load_vector_index(source, settings["api_key"], index_choice)
+            st.success(status)
+            st.write(f"Index file: `{index_path}`")
+            st.write(f"Metadata file: `{metadata_path}`")
+        except Exception as exc:
+            st.error(f"Could not build RAG index: {exc}")
+
+
 def show_task(task: str, records: pd.DataFrame, key_prefix: str = "task") -> None:
     st.header(task)
     if task == "Build my plan":
@@ -135,10 +158,12 @@ def smart_search(records: pd.DataFrame, settings: dict[str, str]) -> None:
     audience, guidance = classify_audience(query)
     with st.expander("Why these results?"):
         st.write(f"NewBG matched this as: {audience}. {guidance}")
-    results = search_records(records, query, limit=10)
+    rag_result = rag_search(records, query, settings["api_key"], limit=10, index_name="all_csv_records")
+    results = rag_result.records
+    with st.expander("RAG status"):
+        st.write(rag_result.status)
 
     ai_answer, ai_error = ask_ai(
-        settings["provider"],
         settings["api_key"],
         f"Help answer this local request with practical Bowling Green next steps: {query}",
         records_to_context(results),
@@ -148,7 +173,7 @@ def smart_search(records: pd.DataFrame, settings: dict[str, str]) -> None:
         st.markdown(ai_answer)
     else:
         st.markdown(local_answer_without_ai(query, results))
-        if ai_error and settings["provider"] != "None":
+        if ai_error and settings["api_key"]:
             with st.expander("AI status"):
                 st.write(ai_error)
 
@@ -177,7 +202,6 @@ def report_generator(records: pd.DataFrame, profiles: pd.DataFrame, settings: di
     local_report = build_report_without_ai(profile, has_car, has_kids, has_pets, priorities, matches)
 
     ai_answer, ai_error = ask_ai(
-        settings["provider"],
         settings["api_key"],
         f"Create a Bowling Green local plan for profile={profile}, has_car={has_car}, has_kids={has_kids}, has_pets={has_pets}, priorities={priorities}. Include today, next few days, longer-stay plan if relevant, top places, transportation warnings, hidden local reality, and what to verify.",
         records_to_context(matches),
@@ -187,7 +211,7 @@ def report_generator(records: pd.DataFrame, profiles: pd.DataFrame, settings: di
         st.markdown(ai_answer)
     else:
         st.markdown(local_report)
-        if ai_error and settings["provider"] != "None":
+        if ai_error and settings["api_key"]:
             with st.expander("AI status"):
                 st.write(ai_error)
 
@@ -393,8 +417,15 @@ def local_map(records: pd.DataFrame) -> None:
     st_folium(bg_map, height=520, use_container_width=True)
 
 
-def animal_section(animal_df: pd.DataFrame) -> None:
+def animal_section(animal_df: pd.DataFrame, settings: dict[str, str]) -> None:
     st.header("Animal Care")
+    question = st.text_input("Ask about animal care", value="I found a lost pet", key="animal_rag_question")
+    rag_result = rag_search(animal_df, question, settings["api_key"], limit=5, index_name="animal_care_csv")
+    with st.expander("Animal care RAG status"):
+        st.write(rag_result.status)
+    st.markdown(local_answer_without_ai(question, rag_result.records))
+
+    st.subheader("Animal care tasks")
     tasks = animal_df["task"].tolist()
     selected = st.selectbox("Animal task", tasks)
     row = animal_df[animal_df["task"] == selected].iloc[0]
@@ -402,8 +433,15 @@ def animal_section(animal_df: pd.DataFrame) -> None:
     render_no_car_checker(row)
 
 
-def parks_section(parks_df: pd.DataFrame) -> None:
+def parks_section(parks_df: pd.DataFrame, settings: dict[str, str]) -> None:
     st.header("Parks & Free Places")
+    question = st.text_input("Ask about parks", value="I want a park for kids and walking", key="parks_rag_question")
+    rag_result = rag_search(parks_df, question, settings["api_key"], limit=5, index_name="parks_csv")
+    with st.expander("Parks RAG status"):
+        st.write(rag_result.status)
+    st.markdown(local_answer_without_ai(question, rag_result.records))
+
+    st.subheader("Filter parks")
     filters = st.multiselect(
         "Park characteristics",
         ["good_for_kids", "good_for_dogs", "good_for_walking", "quiet", "sports_fields", "near_wku", "good_for_families"],
@@ -422,12 +460,14 @@ def parks_section(parks_df: pd.DataFrame) -> None:
 
 def ai_assistant(records: pd.DataFrame, settings: dict[str, str]) -> None:
     st.header("Broad Assistant")
-    st.write("Ask about local life, visitors, businesses, shopping, dealerships, transit, parks, documents, pets, or general planning.")
+    st.write("Ask about local life, visitors, businesses, shopping, dealerships, transit, parks, documents, pets, or general planning. NewBG retrieves from CSV data with RAG first.")
     question = st.text_area("Question", value="Where can I shop, find businesses, or look for car dealerships in Bowling Green?")
     if st.button("Answer", type="primary"):
-        matches = search_records(records, question, limit=8)
+        rag_result = rag_search(records, question, settings["api_key"], limit=8, index_name="all_csv_records")
+        matches = rag_result.records
+        with st.expander("RAG status"):
+            st.write(rag_result.status)
         answer, error = ask_ai(
-            settings["provider"],
             settings["api_key"],
             question,
             records_to_context(matches),
@@ -437,7 +477,7 @@ def ai_assistant(records: pd.DataFrame, settings: dict[str, str]) -> None:
             st.markdown(answer)
         else:
             st.markdown(local_answer_without_ai(question, matches))
-            if error and settings["provider"] != "None":
+            if error and settings["api_key"]:
                 with st.expander("AI status"):
                     st.write(error)
         if not matches.empty:
@@ -454,6 +494,7 @@ def main() -> None:
     tab_names = [
         "Home",
         "Planner & Checklist",
+        "RAG Index",
         "Task Finder",
         "Ask Anything",
         "Local Plan",
@@ -469,20 +510,22 @@ def main() -> None:
     with tabs[1]:
         planner_checklist(records, key_prefix="main_planner")
     with tabs[2]:
-        task_finder(records)
+        rag_admin(records, data, settings)
     with tabs[3]:
-        smart_search(records, settings)
+        task_finder(records)
     with tabs[4]:
-        report_generator(records, data["profiles"], settings)
+        smart_search(records, settings)
     with tabs[5]:
-        no_car_checker(records)
+        report_generator(records, data["profiles"], settings)
     with tabs[6]:
-        local_map(records)
+        no_car_checker(records)
     with tabs[7]:
-        animal_section(data["animal_care"])
+        local_map(records)
     with tabs[8]:
-        parks_section(data["parks"])
+        animal_section(data["animal_care"], settings)
     with tabs[9]:
+        parks_section(data["parks"], settings)
+    with tabs[10]:
         ai_assistant(records, settings)
 
 
